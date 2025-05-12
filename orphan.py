@@ -3,6 +3,7 @@ import os
 import sys
 from enum import Enum
 from parse import compile
+from pathlib import Path
 
 
 entry_points = [ 'vaos-entry.jsx', 'services/mocks/index.js' ]
@@ -22,6 +23,25 @@ class SourceType(Enum):
     UNKNOWN = 7
 
 
+class Import:
+    def __init__(self, source_path, line, line_num):
+        self.source_path = source_path
+        self.line = line
+        self.line_num = line_num
+
+    def __str__(self):
+        return f"{self.line_num}: {self.line}"
+
+
+class LocalImport(Import):
+    def __init__(self, source_path, line, line_num, module, imports, import_all):
+        super().__init__(source_path, line, line_num)
+        self.module = module
+        self.module_path = Path.joinpath(Path(source_path).parent, module).resolve()
+        self.imports = imports
+        self.import_all = import_all
+
+
 class Export:
     def __init__(self, name, line_num):
         self.name = name
@@ -29,10 +49,20 @@ class Export:
         self.references = 0
 
     def __str__(self):
-        return f"{self.name} - line: {self.line_num}"
+        return f"{self.line_num}: {self.name}"
 
 
 class Source:
+    # Import formats
+    import_default_and_named = compile("import {default}, {{{named}}} from '{module}';")
+    import_named = compile("import {{{named}}} from '{module}';")
+    import_default = compile("import {default} from '{module}';")
+    import_dynamic = compile("import(/* webpackChunkName: {chunk_name} */ '{module}').then(({{{named}}}) => {var}")
+    import_file = compile("import '{file}';")
+    require_all = compile("const {all} = require('{module}');")
+    require_all_comment = compile("// const {all} = require('{module}');")
+    require_named = compile("const {{{named}}} = require('{module}');")
+
     # Export formats
     multiple_export = compile("export {{{exports}}};")
     export_const = compile("export const {name} ")
@@ -46,8 +76,6 @@ class Source:
     export_default_object = compile("export default {")
     module_exports_list = compile("module.exports = [{exports}];")
     module_exports_object = compile("module.exports = {{{exports}}};")
-
-    # Import formats
 
     def __init__(self, path):
         self.path = path
@@ -72,29 +100,53 @@ class Source:
         elif self.type == SourceType.JSX:
             self.path_for_import = path[:-4]
         elif self.type == SourceType.JSON:
-            self.path_for_import = path[:-5]
+            self.path_for_import = path
 
         self.exports = {}
-        self.default = None
         self.imports = []
         self.__resolve_definitions()
 
-    def __resolve_import(self, import_):
-        self.imports.append(import_)
+    def __split_by_comma(self, values):
+        values = values.split(',')
+        return [v.strip() for v in values if v.strip()]
+
+    def __resolve_import(self, line, line_num):
+        for import_type in [
+            Source.import_default_and_named,
+            Source.import_named,
+            Source.import_default,
+            Source.import_dynamic,
+            Source.require_all,
+            Source.require_all_comment,
+            Source.require_named,
+        ]:
+            if result := import_type.search(line):
+                if result['module'].startswith('.'):
+                    imports = []
+                    if 'default' in result:
+                        imports.append('default')
+                    if 'named' in result:
+                        imports.extend(self.__split_by_comma(result['named']))
+                    self.imports.append(LocalImport(self.path, line, line_num, result['module'], imports, 'all' in result))
+                else:
+                    self.imports.append(Import(self.path, line, line_num))
+                return
+
+        if result := Source.import_file.search(line):
+            self.imports.append(Import(self.path, line, line_num))
+            return
+
+        eprint(f"Found unexpected import: {line} in file {self.path}:{line_num}")
 
     def __add_export(self, line_num, export_name):
         export = Export(export_name, line_num)
         self.exports[export.name] = export
 
     def __resolve_export(self, export, line_num):
-        for export_type in [
-            Source.multiple_export,
-            # Source.multiple_export_default,
-        ]:
-            if result := export_type.search(export):
-                for name in result['exports'].split(','):
-                    self.__add_export(line_num, name)
-                return
+        if result := Source.multiple_export.search(export):
+            for name in self.__split_by_comma(result['exports']):
+                self.__add_export(line_num, name)
+            return
 
         for export_type in [
             Source.export_const,
@@ -106,17 +158,14 @@ class Source:
             Source.export_default_connect,
             Source.export_default_value,
             Source.export_default_object,
+            Source.module_exports_list,
         ]:
             if result := export_type.search(export):
                 self.__add_export(line_num, result['name'] if 'name' in result else 'default')
                 return
 
-        if result := Source.module_exports_list.search(export):
-            self.__add_export(line_num, 'default')
-            return
-
         if result := Source.module_exports_object.search(export):
-            for name in result['exports'].split(','):
+            for name in self.__split_by_comma(result['exports']):
                 self.__add_export(line_num, name)
             return
 
@@ -141,9 +190,13 @@ class Source:
                 line_num += 1
                 strip_line = line.strip()
                 if strip_line.startswith('import'):
-                    import_, lines = self.__read_until(file, ';', strip_line)
+                    line, lines = self.__read_until(file, ';', strip_line)
                     line_num += lines
-                    self.__resolve_import(import_)
+                    self.__resolve_import(line, line_num)
+                if 'require(' in strip_line:
+                    line, lines = self.__read_until(file, ';', strip_line)
+                    line_num += lines
+                    self.__resolve_import(line, line_num)
                 elif strip_line.startswith('export'):
                     if 'connect' in strip_line:
                         export, lines = self.__read_until(file, ';', strip_line)
@@ -177,6 +230,7 @@ def parse(dir):
 
     return sorted(sources, key=lambda x: x.path)
 
+
 def orphans(dir):
     print(f"Inspecting: {dir}")
     sources = parse(dir)
@@ -186,9 +240,21 @@ def orphans(dir):
         print(f"{source.path}")
         if source.path_for_import:
             print(f"  Importable at: {source.path_for_import}")
-        print(f"  Imports: {len(source.imports)}")
+
+        local_imports = []
+        library_imports = []
         for imp in source.imports:
+            if isinstance(imp, LocalImport):
+                local_imports.append(imp)
+            else:
+                library_imports.append(imp)
+
+        print(f"  Library imports: {len(library_imports)}")
+        for imp in library_imports:
             print(f"    {imp}")
+        print(f"  Local imports: {len(local_imports)}")
+        for imp in local_imports:
+            print(f"    {'*' if imp.import_all else ''}{imp}")
         print(f"  Exports: {len(source.exports)}")
         for export in source.exports.values():
             print(f"    {export}")
