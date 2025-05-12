@@ -1,7 +1,16 @@
 import glob
+import os
 import sys
 from enum import Enum
 from parse import compile
+
+
+entry_points = [ 'vaos-entry.jsx', 'services/mocks/index.js' ]
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
 
 class SourceType(Enum):
     JS = 1
@@ -11,6 +20,7 @@ class SourceType(Enum):
     E2E = 5
     TYPES = 6
     UNKNOWN = 7
+
 
 class Export:
     def __init__(self, name, line_num):
@@ -34,6 +44,8 @@ class Source:
     export_default_connect = compile("export default connect({maps})({component});")
     export_default_value = compile("export default {value_name};")
     export_default_object = compile("export default {")
+    module_exports_list = compile("module.exports = [{exports}];")
+    module_exports_object = compile("module.exports = {{{exports}}};")
 
     # Import formats
 
@@ -99,7 +111,16 @@ class Source:
                 self.__add_export(line_num, result['name'] if 'name' in result else 'default')
                 return
 
-        print(f"Found unexpected export: {export} in file {self.path}:{line_num}")
+        if result := Source.module_exports_list.search(export):
+            self.__add_export(line_num, 'default')
+            return
+
+        if result := Source.module_exports_object.search(export):
+            for name in result['exports'].split(','):
+                self.__add_export(line_num, name)
+            return
+
+        eprint(f"Found unexpected export: {export} in file {self.path}:{line_num}")
 
     def __read_until(self, file, char, initial_line):
         count = 0
@@ -126,9 +147,19 @@ class Source:
                 elif strip_line.startswith('export'):
                     if 'connect' in strip_line:
                         export, lines = self.__read_until(file, ';', strip_line)
+                        line_num += lines
                         self.__resolve_export(export, line_num)
                     else:
                         self.__resolve_export(line, line_num)
+                elif strip_line.startswith('module.exports'):
+                    if '[' in strip_line:
+                        export, lines = self.__read_until(file, ']', strip_line)
+                        line_num += lines
+                        self.__resolve_export(export, line_num)
+                    elif '{' in strip_line:
+                        export, lines = self.__read_until(file, ';', strip_line)
+                        line_num += lines
+                        self.__resolve_export(export, line_num)
 
 
 def parse(dir):
@@ -136,7 +167,8 @@ def parse(dir):
     files_include = glob.glob(dir + '/**/*.js', recursive=True)
     files_include.extend(glob.glob(dir + '/**/*.jsx', recursive=True))
     files_include.extend(glob.glob(dir + '/**/*.json', recursive=True))
-    files_exclude = glob.glob(dir + '/node_modules/**/*.js', recursive=True)
+    files_exclude = glob.glob(dir + '/lib/**/*.js', recursive=True)
+    files_exclude.extend(glob.glob(dir + '/node_modules/**/*.js', recursive=True))
     files_exclude.extend(glob.glob(dir + '/node_modules/**/*.jsx', recursive=True))
     files_exclude.extend(glob.glob(dir + '/node_modules/**/*.json', recursive=True))
 
@@ -144,9 +176,6 @@ def parse(dir):
         sources.append(Source(file))
 
     return sorted(sources, key=lambda x: x.path)
-
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
 
 def orphans(dir):
     print(f"Inspecting: {dir}")
@@ -157,7 +186,7 @@ def orphans(dir):
         print(f"{source.path}")
         if source.path_for_import:
             print(f"  Importable at: {source.path_for_import}")
-        print("  Imports:")
+        print(f"  Imports: {len(source.imports)}")
         for imp in source.imports:
             print(f"    {imp}")
         print(f"  Exports: {len(source.exports)}")
@@ -169,14 +198,15 @@ def orphans(dir):
         if source.type == SourceType.UNKNOWN:
             eprint(f"Unknown file type: {source.path}")
             continue
+        entry_paths = [ os.path.join(dir, entry_point) for entry_point in entry_points ]
         # Check for expected exports
-        if source.type in [ SourceType.JS, SourceType.JSX, SourceType.JSON ]:
-            if len(source.exports) == 0:
-                eprint(f"Source file {source.path} has no exports")
+        if (source.type in [ SourceType.JS, SourceType.JSX, SourceType.JSON ]
+            and len(source.exports) == 0
+            and source.path not in entry_paths):
+            eprint(f"Source file {source.path} has no exports")
         # Check for unexpected exports
-        if source.type in [ SourceType.UNIT, SourceType.E2E ]:
-            if len(source.exports) > 0:
-                eprint(f"Test file {source.path} has exports")
+        if source.type in [ SourceType.UNIT, SourceType.E2E ] and len(source.exports) > 0:
+            eprint(f"Test file {source.path} has exports")
 
 
 if __name__ == "__main__":
