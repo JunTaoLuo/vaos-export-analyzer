@@ -253,7 +253,8 @@ class Source:
 
 # Abstraction sources that compose an application
 class Application:
-    def __init__(self, sources: list[Source], required_paths: list[str]):
+    def __init__(self, sources: list[Source], required_paths: list[str], root):
+        self.root = root
         self.sources = { source.path: source for source in sources }
         self.required_paths = required_paths
         self.modules: dict[str, Source] = {}
@@ -288,6 +289,9 @@ class Application:
                 else:
                     eprint(f"Module {local_import.module_path} from {source.path}:{local_import.line_num} cannot be found")
 
+    def __relative_path(self, path):
+        return Path(path).relative_to(self.root)
+
     def __recommend_actions(self):
         self.unused = False
         unused_sources = []
@@ -313,13 +317,13 @@ class Application:
                     unused_sources.append(module.unit_path)
             # Remove unused exports
             elif len(unused_exports) > 0:
-                print(f"{len(unused_exports)} unused exports found in {module.path}:")
+                print(f"{len(unused_exports)} unused exports found in {self.__relative_path(module.path)}:")
                 for export in unused_exports:
                     print(f"  line {export.line_num}: {export.name}")
                     del module.exports[export.name]
 
         for source_path in unused_sources:
-            print(f"No used exports in {source_path}, file can be removed")
+            print(f"No used exports in {self.__relative_path(source_path)}, file can be removed")
 
             # Remove from sources
             source = self.sources[source_path]
@@ -347,7 +351,7 @@ class Application:
                         if import_name in module.exports:
                             module.exports[import_name].references -= 1
 
-
+    # Analyze usage and make recommendations until all unused files/exports are removed
     def analyze_usage(self):
         iteration = 1
         while self.unused:
@@ -399,7 +403,7 @@ def analyze(dir):
 
     print(f"Analyzing {len(sources)} source files")
 
-    app = Application(sources, required_paths)
+    app = Application(sources, required_paths, dir)
     app.resolve_references()
 
     # inspect_sources(app.sources.values())
