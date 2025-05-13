@@ -6,8 +6,8 @@ from parse import compile
 from pathlib import Path
 
 
-# These are the entry points to the applications and must not be removed even if unreferenced by other files
-entry_points = [ 'vaos-entry.jsx', 'services/mocks/index.js' ]
+# These are the required files for the application and must not be removed even if unreferenced
+required_files = [ 'vaos-entry.jsx', 'services/mocks/index.js', 'package.json', 'jsdoc.json', 'manifest.json' ]
 
 
 # Print to stderr
@@ -253,13 +253,15 @@ class Source:
 
 # Abstraction sources that compose an application
 class Application:
-    def __init__(self, sources: list[Source]):
-        self.sources = sources
+    def __init__(self, sources: list[Source], required_paths: list[str]):
+        self.sources = { source.path: source for source in sources }
+        self.required_paths = required_paths
         self.modules: dict[str, Source] = {}
+        self.unused = True
 
     def resolve_references(self):
         # Create dictionary of modules using their import path(s)
-        for source in self.sources:
+        for source in self.sources.values():
             if source.type in [ SourceType.JS, SourceType.JSX, SourceType.JSON ]:
                 for path in source.paths_for_import:
                     if path in self.modules:
@@ -267,7 +269,7 @@ class Application:
                     self.modules[path] = source
 
         # Count number of references for each export via imports from other files
-        for source in self.sources:
+        for source in self.sources.values():
             for local_import in source.local_imports:
                 if local_import.module_path in self.modules:
                     module = self.modules[local_import.module_path]
@@ -285,6 +287,42 @@ class Application:
                                 eprint(f"Import {import_name} of {local_import.module_path} from {source.path}:{local_import.line_num} cannot found")
                 else:
                     eprint(f"Module {local_import.module_path} from {source.path}:{local_import.line_num} cannot be found")
+
+    def __recommend_actions(self):
+        self.unused = False
+        unused_sources = []
+
+        for module in self.modules.values():
+            # required files must be preserved
+            if module.path in self.required_paths:
+                continue
+
+            # module without exports is an error
+            if len(module.exports) == 0:
+                eprint(f"Source file {module.path} has no exports")
+
+            unused_exports = [export for export in module.exports.values() if export.references == 0]
+            # Remove entire file and associated tests if all exports are unused
+            if len(unused_exports) == len(module.exports):
+                # index.js/jsx sources are represented twice in the modules dictionary (once under ./index and once as ./)
+                if module.path in unused_sources:
+                    continue
+                self.unused = True
+                unused_sources.append(module.path)
+                if module.unit_path in self.sources:
+                    unused_sources.append(module.unit_path)
+            # Remove unused exports
+            elif len(unused_exports) > 0:
+                print(f"{len(unused_exports)} unused exports found in {module.path}:")
+                for export in unused_exports:
+                    print(f"  line {export.line_num}: {export.name}")
+
+        for source in unused_sources:
+            print(f"No used exports in {source}, file can be removed")
+
+    def analyze_usage(self):
+        self.__recommend_actions()
+
 
 
 # Parse all files in the directory into Sources
@@ -323,29 +361,26 @@ def inspect_sources(sources: list[Source]):
 
 def analyze(dir):
     print(f"Inspecting: {dir}")
+    required_paths = [ str(os.path.join(dir, file)) for file in required_files ]
     sources = parse(dir)
 
     print(f"Analyzing {len(sources)} source files")
 
-    app = Application(sources)
+    app = Application(sources, required_paths)
     app.resolve_references()
 
-    inspect_sources(app.sources)
+    inspect_sources(app.sources.values())
 
     for source in sources:
         # Ensure file type recognized
         if source.type == SourceType.UNKNOWN:
             eprint(f"Unknown file type: {source.path}")
             continue
-        entry_paths = [ os.path.join(dir, entry_point) for entry_point in entry_points ]
-        # Check for expected exports
-        if (source.type in [ SourceType.JS, SourceType.JSX, SourceType.JSON ]
-            and len(source.exports) == 0
-            and source.path not in entry_paths):
-            eprint(f"Source file {source.path} has no exports")
         # Check for unexpected exports
         if source.type in [ SourceType.UNIT, SourceType.E2E ] and len(source.exports) > 0:
             eprint(f"Test file {source.path} has exports")
+
+    app.analyze_usage()
 
 
 if __name__ == "__main__":
