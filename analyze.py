@@ -316,13 +316,46 @@ class Application:
                 print(f"{len(unused_exports)} unused exports found in {module.path}:")
                 for export in unused_exports:
                     print(f"  line {export.line_num}: {export.name}")
+                    del module.exports[export.name]
 
-        for source in unused_sources:
-            print(f"No used exports in {source}, file can be removed")
+        for source_path in unused_sources:
+            print(f"No used exports in {source_path}, file can be removed")
+
+            # Remove from sources
+            source = self.sources[source_path]
+            del self.sources[source_path]
+
+            # Remove from modules
+            for path in source.paths_for_import:
+                del self.modules[path]
+
+            # Remove import references
+            for local_import in source.local_imports:
+                # Source might have been removed prior to removing unit test so ignore missing modules
+                if local_import.module_path not in self.modules:
+                    continue
+                module = self.modules[local_import.module_path]
+                # ignore imports in unit tests from their component, references were never added
+                if source.type == SourceType.UNIT and source.path == module.unit_path:
+                    continue
+                if local_import.import_all:
+                    for export in module.exports.values():
+                        export.references -= 1
+                else:
+                    for import_name in local_import.imports:
+                        # If the import was not found, an error would have been printed previously, so ignore reference
+                        if import_name in module.exports:
+                            module.exports[import_name].references -= 1
+
 
     def analyze_usage(self):
-        self.__recommend_actions()
-
+        iteration = 1
+        while self.unused:
+            print(f"\nIteration {iteration} recommendations:")
+            print(f"============================")
+            self.__recommend_actions()
+            iteration += 1
+        print(f"No more recommendations")
 
 
 # Parse all files in the directory into Sources
@@ -369,7 +402,7 @@ def analyze(dir):
     app = Application(sources, required_paths)
     app.resolve_references()
 
-    inspect_sources(app.sources.values())
+    # inspect_sources(app.sources.values())
 
     for source in sources:
         # Ensure file type recognized
