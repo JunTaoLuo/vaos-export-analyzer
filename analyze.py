@@ -6,9 +6,11 @@ from parse import compile
 from pathlib import Path
 
 
+# These are the entry points to the applications and must not be removed even if unreferenced by other files
 entry_points = [ 'vaos-entry.jsx', 'services/mocks/index.js' ]
 
 
+# Print to stderr
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
@@ -23,6 +25,7 @@ class SourceType(Enum):
     UNKNOWN = 7
 
 
+# Abstraction for library and local imports
 class Import:
     def __init__(self, source_path, line, line_num):
         self.source_path = source_path
@@ -33,19 +36,26 @@ class Import:
         return f"{self.line_num}: {self.line}"
 
 
+# Abstraction for local imports
 class LocalImport(Import):
     def __init__(self, source_path, line, line_num, module, imports, import_all):
         super().__init__(source_path, line, line_num)
+        # parsed module of the import e.g. '../relative/path/to/import/module'
         self.module = module
-        self.module_path = Path.joinpath(Path(source_path).parent, module).resolve()
+        # resolved absolute path to the imported module
+        self.module_path = str(Path.joinpath(Path(source_path).parent, module).resolve())
+        # list of imports (including default) from the module
         self.imports = imports
+        # flag for importing all exports of a module (e.g. for import * or require imports)
         self.import_all = import_all
 
 
+# Abstraction for exports
 class Export:
     def __init__(self, name, line_num):
         self.name = name
         self.line_num = line_num
+        # counting number of times the export was imported by other files
         self.references = 0
 
     def __str__(self):
@@ -54,6 +64,7 @@ class Export:
 
 class Source:
     # Import formats
+    import_star = compile("import * as {all} from '{module}';")
     import_default_and_named = compile("import {default}, {{{named}}} from '{module}';")
     import_named = compile("import {{{named}}} from '{module}';")
     import_default = compile("import {default} from '{module}';")
@@ -62,9 +73,11 @@ class Source:
     require_all = compile("const {all} = require('{module}');")
     require_all_comment = compile("// const {all} = require('{module}');")
     require_named = compile("const {{{named}}} = require('{module}');")
+    import_alias = compile("{named} as {alias}")
 
     # Export formats
     multiple_export = compile("export {{{exports}}};")
+    multiple_export_const = compile("export const {{{exports}}} =")
     export_const = compile("export const {name} ")
     export_function = compile("export function {name}(")
     export_async_function = compile("export async function {name}(")
@@ -77,10 +90,12 @@ class Source:
     module_exports_list = compile("module.exports = [{exports}];")
     module_exports_object = compile("module.exports = {{{exports}}};")
 
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = path
 
         self.type = SourceType.UNKNOWN
+        self.paths_for_import = []
+        self.unit_path = ""
         if path.endswith('.unit.spec.jsx'):
             self.type = SourceType.UNIT
         elif path.endswith('.cypress.spec.js'):
@@ -89,29 +104,35 @@ class Source:
             self.type = SourceType.TYPES
         elif path.endswith('.js'):
             self.type = SourceType.JS
+            self.paths_for_import.append(path[:-3])
+            self.unit_path = f"{path[:-3]}.unit.spec.jsx"
+            # Adding additional import path for index.js sources
+            if path.endswith('/index.js'):
+                self.paths_for_import.append(path[:-9])
         elif path.endswith('.jsx'):
             self.type = SourceType.JSX
+            self.paths_for_import.append(path[:-4])
+            self.unit_path = f"{path[:-4]}.unit.spec.jsx"
+            # Adding additional import path for index.jsx sources
+            if path.endswith('/index.jsx'):
+                self.paths_for_import.append(path[:-10])
         elif path.endswith('.json'):
             self.type = SourceType.JSON
+            self.paths_for_import.append(path)
 
-        self.path_for_import = None
-        if self.type == SourceType.JS:
-            self.path_for_import = path[:-3]
-        elif self.type == SourceType.JSX:
-            self.path_for_import = path[:-4]
-        elif self.type == SourceType.JSON:
-            self.path_for_import = path
-
-        self.exports = {}
-        self.imports = []
+        self.exports: dict[str, Export] = {}
+        self.local_imports: list[LocalImport] = []
+        self.library_imports: list[Import] = []
         self.__resolve_definitions()
 
+    # Split by comma and remove empty entries
     def __split_by_comma(self, values):
         values = values.split(',')
         return [v.strip() for v in values if v.strip()]
 
     def __resolve_import(self, line, line_num):
         for import_type in [
+            Source.import_star,
             Source.import_default_and_named,
             Source.import_named,
             Source.import_default,
@@ -121,19 +142,25 @@ class Source:
             Source.require_named,
         ]:
             if result := import_type.search(line):
-                if result['module'].startswith('.'):
+                # Local imports, exclude imports of lib/moment-tz.js
+                if result['module'].startswith('.') and not result['module'].endswith('moment-tz'):
                     imports = []
                     if 'default' in result:
                         imports.append('default')
                     if 'named' in result:
-                        imports.extend(self.__split_by_comma(result['named']))
-                    self.imports.append(LocalImport(self.path, line, line_num, result['module'], imports, 'all' in result))
+                        for named in self.__split_by_comma(result['named']):
+                            if alias_result := Source.import_alias.search(named):
+                                imports.append(alias_result['named'])
+                            else:
+                                imports.append(named)
+                    self.local_imports.append(LocalImport(self.path, line, line_num, result['module'], imports, 'all' in result))
                 else:
-                    self.imports.append(Import(self.path, line, line_num))
+                    self.library_imports.append(Import(self.path, line, line_num))
                 return
 
+        # exclude file imports (e.g. import './sass/vaos.scss';)
         if result := Source.import_file.search(line):
-            self.imports.append(Import(self.path, line, line_num))
+            self.library_imports.append(Import(self.path, line, line_num))
             return
 
         eprint(f"Found unexpected import: {line} in file {self.path}:{line_num}")
@@ -143,10 +170,14 @@ class Source:
         self.exports[export.name] = export
 
     def __resolve_export(self, export, line_num):
-        if result := Source.multiple_export.search(export):
-            for name in self.__split_by_comma(result['exports']):
-                self.__add_export(line_num, name)
-            return
+        for export_type in [
+            Source.multiple_export,
+            Source.multiple_export_const,
+        ]:
+            if result := export_type.search(export):
+                for name in self.__split_by_comma(result['exports']):
+                    self.__add_export(line_num, name)
+                return
 
         for export_type in [
             Source.export_const,
@@ -171,10 +202,11 @@ class Source:
 
         eprint(f"Found unexpected export: {export} in file {self.path}:{line_num}")
 
-    def __read_until(self, file, char, initial_line):
+    # Read until the expected token is added to the result
+    def __read_until(self, file, token, initial_line):
         count = 0
         result = initial_line
-        while char not in result:
+        while token not in result:
             result += file.readline().strip()
             count += 1
         return result, count
@@ -189,14 +221,17 @@ class Source:
             while (line := file.readline()):
                 line_num += 1
                 strip_line = line.strip()
+                # ES module imports
                 if strip_line.startswith('import'):
                     line, lines = self.__read_until(file, ';', strip_line)
                     line_num += lines
                     self.__resolve_import(line, line_num)
+                # CommonJS imports
                 if 'require(' in strip_line:
                     line, lines = self.__read_until(file, ';', strip_line)
                     line_num += lines
                     self.__resolve_import(line, line_num)
+                # ES exports
                 elif strip_line.startswith('export'):
                     if 'connect' in strip_line:
                         export, lines = self.__read_until(file, ';', strip_line)
@@ -204,6 +239,7 @@ class Source:
                         self.__resolve_export(export, line_num)
                     else:
                         self.__resolve_export(line, line_num)
+                #  CommonJS exports
                 elif strip_line.startswith('module.exports'):
                     if '[' in strip_line:
                         export, lines = self.__read_until(file, ']', strip_line)
@@ -215,7 +251,44 @@ class Source:
                         self.__resolve_export(export, line_num)
 
 
-def parse(dir):
+# Abstraction sources that compose an application
+class Application:
+    def __init__(self, sources: list[Source]):
+        self.sources = sources
+        self.modules: dict[str, Source] = {}
+
+    def resolve_references(self):
+        # Create dictionary of modules using their import path(s)
+        for source in self.sources:
+            if source.type in [ SourceType.JS, SourceType.JSX, SourceType.JSON ]:
+                for path in source.paths_for_import:
+                    if path in self.modules:
+                        eprint(f"Duplicate import path: {path} for {source.path} and {self.modules[path].path}")
+                    self.modules[path] = source
+
+        # Count number of references for each export via imports from other files
+        for source in self.sources:
+            for local_import in source.local_imports:
+                if local_import.module_path in self.modules:
+                    module = self.modules[local_import.module_path]
+                    # ignore imports in unit tests from their component, otherwise components with tests will never be removed
+                    if source.type == SourceType.UNIT and source.path == module.unit_path:
+                        continue
+                    if local_import.import_all:
+                        for export in module.exports.values():
+                            export.references += 1
+                    else:
+                        for import_name in local_import.imports:
+                            if import_name in module.exports:
+                                module.exports[import_name].references += 1
+                            else:
+                                eprint(f"Import {import_name} of {local_import.module_path} from {source.path}:{local_import.line_num} cannot found")
+                else:
+                    eprint(f"Module {local_import.module_path} from {source.path}:{local_import.line_num} cannot be found")
+
+
+# Parse all files in the directory into Sources
+def parse(dir) -> list[Source]:
     sources = []
     files_include = glob.glob(dir + '/**/*.js', recursive=True)
     files_include.extend(glob.glob(dir + '/**/*.jsx', recursive=True))
@@ -231,33 +304,33 @@ def parse(dir):
     return sorted(sources, key=lambda x: x.path)
 
 
-def orphans(dir):
-    print(f"Inspecting: {dir}")
-    sources = parse(dir)
-
-    print(f"Found {len(sources)} source files")
+# Diagnostics for all sources
+def inspect_sources(sources: list[Source]):
     for source in sources:
         print(f"{source.path}")
-        if source.path_for_import:
-            print(f"  Importable at: {source.path_for_import}")
-
-        local_imports = []
-        library_imports = []
-        for imp in source.imports:
-            if isinstance(imp, LocalImport):
-                local_imports.append(imp)
-            else:
-                library_imports.append(imp)
-
-        print(f"  Library imports: {len(library_imports)}")
-        for imp in library_imports:
+        if source.paths_for_import:
+            print(f"  Importable at: {source.paths_for_import}")
+        print(f"  Library imports: {len(source.library_imports)}")
+        for imp in source.library_imports:
             print(f"    {imp}")
-        print(f"  Local imports: {len(local_imports)}")
-        for imp in local_imports:
+        print(f"  Local imports: {len(source.local_imports)}")
+        for imp in source.local_imports:
             print(f"    {'*' if imp.import_all else ''}{imp}")
         print(f"  Exports: {len(source.exports)}")
         for export in source.exports.values():
-            print(f"    {export}")
+            print(f"    {export} used {export.references} times")
+
+
+def analyze(dir):
+    print(f"Inspecting: {dir}")
+    sources = parse(dir)
+
+    print(f"Analyzing {len(sources)} source files")
+
+    app = Application(sources)
+    app.resolve_references()
+
+    inspect_sources(app.sources)
 
     for source in sources:
         # Ensure file type recognized
@@ -276,4 +349,4 @@ def orphans(dir):
 
 
 if __name__ == "__main__":
-    orphans(sys.argv[1])
+    analyze(sys.argv[1])
