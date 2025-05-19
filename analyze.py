@@ -49,6 +49,9 @@ class LocalImport(Import):
         # flag for importing all exports of a module (e.g. for import * or require imports)
         self.import_all = import_all
 
+    def __str__(self):
+        return f"{self.line_num}: {self.line} imports: {self.imports}"
+
 
 # Abstraction for exports
 class Export:
@@ -57,6 +60,14 @@ class Export:
         self.line_num = line_num
         # counting number of times the export was imported by other files
         self.references = 0
+        # counting number of times the export was imported by associated unit test
+        self.unit_references = 0
+
+    def increment_reference(self, reference_type):
+        if reference_type == 'unit':
+            self.unit_references += 1
+        else:
+            self.references += 1
 
     def __str__(self):
         return f"{self.line_num}: {self.name}"
@@ -275,15 +286,14 @@ class Application:
                 if local_import.module_path in self.modules:
                     module = self.modules[local_import.module_path]
                     # ignore imports in unit tests from their component, otherwise components with tests will never be removed
-                    if source.type == SourceType.UNIT and source.path == module.unit_path:
-                        continue
+                    reference_type = 'unit' if source.type == SourceType.UNIT and source.path == module.unit_path else 'source'
                     if local_import.import_all:
                         for export in module.exports.values():
-                            export.references += 1
+                            export.increment_reference(reference_type)
                     else:
                         for import_name in local_import.imports:
                             if import_name in module.exports:
-                                module.exports[import_name].references += 1
+                                module.exports[import_name].increment_reference(reference_type)
                             else:
                                 eprint(f"Import {import_name} of {local_import.module_path} from {source.path}:{local_import.line_num} cannot found")
                 else:
@@ -306,7 +316,7 @@ class Application:
                 eprint(f"Source file {module.path} has no exports")
 
             unused_exports = [export for export in module.exports.values() if export.references == 0]
-            # Remove entire file and associated tests if all exports are unused
+            # Remove entire file and associated tests if all exports are unused (other than by unit tests)
             if len(unused_exports) == len(module.exports):
                 # index.js/jsx sources are represented twice in the modules dictionary (once under ./index and once as ./)
                 if module.path in unused_sources:
@@ -317,8 +327,11 @@ class Application:
                     unused_sources.append(module.unit_path)
             # Remove unused exports
             elif len(unused_exports) > 0:
-                print(f"{len(unused_exports)} unused exports found in {self.__relative_path(module.path)}:")
-                for export in unused_exports:
+                unused_by_unit_tests = [export for export in unused_exports if export.unit_references == 0]
+                if len(unused_by_unit_tests) == 0:
+                    continue
+                print(f"{len(unused_by_unit_tests)} unused exports found in {self.__relative_path(module.path)}:")
+                for export in unused_by_unit_tests:
                     print(f"  line {export.line_num}: {export.name}")
                     del module.exports[export.name]
 
@@ -393,7 +406,7 @@ def inspect_sources(sources: list[Source]):
             print(f"    {'*' if imp.import_all else ''}{imp}")
         print(f"  Exports: {len(source.exports)}")
         for export in source.exports.values():
-            print(f"    {export} used {export.references} times")
+            print(f"    {export} used {export.references} times and {export.unit_references} times by unit tests")
 
 
 def analyze(dir):
